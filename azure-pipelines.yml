@@ -1,0 +1,61 @@
+variables:
+  CI: true
+trigger:
+  - master
+jobs:
+  - job:
+    displayName: Linux
+    pool:
+      vmImage: 'ubuntu-16.04'
+    steps:
+      - checkout: self
+        fetchDepth: 10
+      - script: rustup component add clippy
+        displayName: Setup Rust
+      - script: make -j"$(cat /proc/cpuinfo | grep -e '^processor' | wc -l)" debug
+        displayName: Build
+      - script: make -j"$(cat /proc/cpuinfo | grep -e '^processor' | wc -l)" check
+        displayName: Check
+  - job:
+    displayName: Windows
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+      - checkout: self
+        fetchDepth: 10
+      - script: rustup component add clippy
+        displayName: Setup Rust
+      - script: |
+          make debug
+        displayName: Build
+      - script: make check
+        displayName: Check
+  - job:
+    displayName: macOS
+    pool:
+      vmImage: 'macOS-latest'
+    variables:
+      RUSTUP_HOME: $(Pipeline.Workspace)/.rustup
+      CARGO_HOME: $(Pipeline.Workspace)/.cargo
+    steps:
+      - checkout: self
+        fetchDepth: 10
+      - script: |
+          curl -sSf https://sh.rustup.rs | bash -s -- -v -y --no-modify-path
+          $(CARGO_HOME)/bin/rustup component add clippy
+          echo "##vso[task.prependpath]$(CARGO_HOME)/bin"
+        displayName: Setup Rust
+      - script: |
+          make -j"$(sysctl hw.logicalcpu | cut -d' ' -f2)" debug 2> >(tee stderr.log >&2)
+          CODE=$?
+          grep -qe ^warning stderr.log && grep -e ^warning stderr.log | xargs -ILINE echo "##vso[task.logissue type=warning]LINE" || true
+          grep -qe ^error stderr.log && grep -e ^error stderr.log | xargs -ILINE echo "##vso[task.logissue type=error]LINE" || true
+          exit $CODE
+        displayName: Build
+      - script: |
+          make -j"$(sysctl hw.logicalcpu | cut -d' ' -f2)" check 2> >(tee stderr.log >&2)
+          CODE=$?
+          grep -qe ^warning stderr.log && grep -e ^warning stderr.log | xargs -ILINE echo "##vso[task.logissue type=warning]LINE" || true
+          grep -qe ^error stderr.log && grep -e ^error stderr.log | xargs -ILINE echo "##vso[task.logissue type=error]LINE" || true
+          exit $CODE
+        displayName: Check
