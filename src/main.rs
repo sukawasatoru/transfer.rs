@@ -26,6 +26,7 @@ use regex::Regex;
 use structopt::StructOpt;
 
 use transfer_rs::transfer_rs::prelude::*;
+use uuid::Uuid;
 
 type BoxFut = Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>;
 
@@ -119,22 +120,26 @@ struct ParseMultipartContext {
     boundary: String,
     command: ParseType,
     name: Option<String>,
+    file_uuid: Option<Uuid>,
     filename: Option<String>,
     buffer: Vec<u8>,
     regexs: Arc<MultipartRegexs>,
     body_skip_crlf: bool,
+    file_root: PathBuf,
 }
 
 impl ParseMultipartContext {
-    fn new(boundary: String, regexs: Arc<MultipartRegexs>) -> Self {
+    fn new(boundary: String, regexs: Arc<MultipartRegexs>, file_root: PathBuf) -> Self {
         Self {
             boundary,
             command: ParseType::LoadBoundary,
             name: Default::default(),
+            file_uuid: Default::default(),
             filename: Default::default(),
             buffer: Default::default(),
             regexs,
             body_skip_crlf: Default::default(),
+            file_root,
         }
     }
 }
@@ -239,7 +244,8 @@ impl ParseMultipartCommand for ParseType {
                             match context.regexs.content_disposition_filename.captures(&s) {
                                 Some(filename) => match filename.get(1) {
                                     Some(filename) => {
-                                        context.filename = Some(filename.as_str().to_owned())
+                                        context.file_uuid = Some(Uuid::new_v4());
+                                        context.filename = Some(filename.as_str().to_owned());
                                     }
                                     None => return Err(format_err!("unexpected")),
                                 },
@@ -338,7 +344,10 @@ impl ParseMultipartCommand for ParseType {
                     }
                     context.body_skip_crlf = true;
                     let filename = &context.filename.as_ref().unwrap();
-                    let filepath = PathBuf::new().join("data").join(filename);
+                    let filepath = context
+                        .file_root
+                        .join(context.file_uuid.unwrap().to_string())
+                        .join(filename);
                     match write_file(&filepath, &line) {
                         Ok(_) => (),
                         Err(e) => return Err(e),
@@ -352,6 +361,7 @@ impl ParseMultipartCommand for ParseType {
 }
 
 fn upload_handler(req: Request<Body>, multipart_regexs: Arc<MultipartRegexs>) -> BoxFut {
+    let file_root = "data";
     if let Some(val) = req.headers().get(hyper::header::CONTENT_TYPE) {
         if let Ok(a) = val.to_str() {
             if a.to_lowercase().contains("multipart/form-data") {
@@ -381,7 +391,11 @@ fn upload_handler(req: Request<Body>, multipart_regexs: Arc<MultipartRegexs>) ->
                 return Box::new(
                     req.into_body()
                         .fold(
-                            ParseMultipartContext::new(boundary, multipart_regexs.clone()),
+                            ParseMultipartContext::new(
+                                boundary,
+                                multipart_regexs.clone(),
+                                PathBuf::new().join(file_root),
+                            ),
                             move |mut context, data| {
                                 debug!("chunk size: {}", data.len());
                                 let mut buf = Vec::new();
@@ -437,22 +451,46 @@ fn upload_handler(req: Request<Body>, multipart_regexs: Arc<MultipartRegexs>) ->
             }
         }
     }
-    let (_head, body) = req.into_parts();
+
+    let (head, body) = req.into_parts();
+    let filename = match head.headers.get("x-tp-filename") {
+        Some(filename) => match filename.to_str() {
+            Ok(filename) => filename.to_owned(),
+            _ => "a".to_owned(),
+        },
+        None => "a".to_owned(),
+    };
     let body = body.concat2();
-    Box::new(body.map(|data| match std::fs::write("data/aa", data) {
-        Ok(_) => {
-            info!("wrote");
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Body::from("ok"))
-                .unwrap()
+    Box::new(body.map(move |data| {
+        let file_id = Uuid::new_v4();
+        let filepath = PathBuf::new()
+            .join(file_root)
+            .join(format!("{}", file_id))
+            .join(filename);
+        match std::fs::create_dir_all(filepath.parent().unwrap()) {
+            Ok(_) => (),
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("failed to create directory"))
+                    .unwrap()
+            }
         }
-        Err(e) => {
-            info!("err: {:?}", e);
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap()
+        match std::fs::write(filepath, data) {
+            Ok(_) => {
+                info!("wrote");
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("ok"))
+                    .unwrap()
+            }
+            Err(e) => {
+                info!("err: {:?}", e);
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            }
         }
     }))
 }
