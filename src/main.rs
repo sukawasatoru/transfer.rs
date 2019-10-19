@@ -15,7 +15,7 @@
  */
 
 use std::io::{prelude::*, BufReader, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use failure::format_err;
@@ -24,9 +24,9 @@ use hyper::{service, Body, Method, Request, Response, Server, StatusCode};
 use log::{debug, info, warn};
 use regex::Regex;
 use structopt::StructOpt;
+use uuid::Uuid;
 
 use transfer_rs::transfer_rs::prelude::*;
-use uuid::Uuid;
 
 type BoxFut = Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>;
 
@@ -122,6 +122,7 @@ struct ParseMultipartContext {
     name: Option<String>,
     file_uuid: Option<Uuid>,
     filename: Option<String>,
+    file_writer: Option<BufWriter<std::fs::File>>,
     buffer: Vec<u8>,
     regexs: Arc<MultipartRegexs>,
     body_skip_crlf: bool,
@@ -136,6 +137,7 @@ impl ParseMultipartContext {
             name: Default::default(),
             file_uuid: Default::default(),
             filename: Default::default(),
+            file_writer: Default::default(),
             buffer: Default::default(),
             regexs,
             body_skip_crlf: Default::default(),
@@ -275,28 +277,6 @@ impl ParseMultipartCommand for ParseType {
                 }
             }
             ParseType::Body => {
-                let write_file = |filepath: &Path, payload: &[u8]| -> Fallible<()> {
-                    match std::fs::create_dir_all(filepath.parent().unwrap()) {
-                        Ok(_) => (),
-                        Err(e) => return Err(format_err!("failed to create directory")),
-                    }
-                    // TODO: unique path for append.
-                    let file = match std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(filepath)
-                    {
-                        Ok(file) => file,
-                        Err(e) => return Err(format_err!("failed to open file: {:?}", e)),
-                    };
-                    let mut writer = BufWriter::new(file);
-                    match writer.write_all(payload) {
-                        Ok(_) => (),
-                        Err(e) => return Err(format_err!("failed to write file: {:?}", e)),
-                    }
-                    writer.flush().ok();
-                    Ok(())
-                };
                 let mut line = {
                     let mut line = Vec::new();
                     match reader.read_until(b'\n', &mut line) {
@@ -325,13 +305,23 @@ impl ParseMultipartCommand for ParseType {
                 };
                 if line == format!("--{}\r\n", context.boundary).as_bytes() {
                     info!("match separator");
+                    let mut writer = None;
+                    std::mem::swap(&mut writer, &mut context.file_writer);
+                    if let Some(mut writer) = writer {
+                        writer.flush().ok();
+                    }
                     context.command = ParseType::LoadContentDescription;
                     context.body_skip_crlf = false;
-                    return Ok(CommandRet::NextCommand);
+                    Ok(CommandRet::NextCommand)
                 } else if line == format!("--{}--\r\n", context.boundary).as_bytes() {
                     info!("match end");
+                    let mut writer = None;
+                    std::mem::swap(&mut writer, &mut context.file_writer);
+                    if let Some(mut writer) = writer {
+                        writer.flush().ok();
+                    }
                     context.command = ParseType::End;
-                    return Ok(CommandRet::NextCommand);
+                    Ok(CommandRet::NextCommand)
                 } else {
                     info!("body.len: '{}'", line.len());
                     if context.body_skip_crlf {
@@ -343,16 +333,30 @@ impl ParseMultipartCommand for ParseType {
                         context.body_skip_crlf = true;
                     }
                     context.body_skip_crlf = true;
-                    let filename = &context.filename.as_ref().unwrap();
-                    let filepath = context
-                        .file_root
-                        .join(context.file_uuid.unwrap().to_string())
-                        .join(filename);
-                    match write_file(&filepath, &line) {
-                        Ok(_) => (),
-                        Err(e) => return Err(e),
+                    let writer = match context.file_writer {
+                        Some(ref mut writer) => writer,
+                        None => {
+                            let filename = context.filename.as_ref().unwrap();
+                            let filepath = context
+                                .file_root
+                                .join(context.file_uuid.unwrap().to_string())
+                                .join(filename);
+                            let create_dir_ret =
+                                std::fs::create_dir_all(filepath.parent().unwrap());
+                            if let Err(e) = create_dir_ret {
+                                return Err(format_err!("failed to create directory: {:?}", e));
+                            }
+                            context.file_writer = match std::fs::File::create(filepath) {
+                                Ok(file) => Some(BufWriter::new(file)),
+                                Err(e) => return Err(format_err!("failed to open file: {:?}", e)),
+                            };
+                            context.file_writer.as_mut().unwrap()
+                        }
+                    };
+                    match writer.write_all(&line) {
+                        Ok(_) => Ok(CommandRet::NextCommand),
+                        Err(e) => return Err(format_err!("failed to write file: {:?}", e)),
                     }
-                    return Ok(CommandRet::NextCommand);
                 }
             }
             ParseType::End => Ok(CommandRet::Consumed),
@@ -470,10 +474,11 @@ fn upload_handler(req: Request<Body>, multipart_regexs: Arc<MultipartRegexs>) ->
         match std::fs::create_dir_all(filepath.parent().unwrap()) {
             Ok(_) => (),
             Err(e) => {
+                warn!("failed to create directory: {:?}", e);
                 return Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::from("failed to create directory"))
-                    .unwrap()
+                    .unwrap();
             }
         }
         match std::fs::write(filepath, data) {
