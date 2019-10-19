@@ -38,7 +38,7 @@ struct Opt {
     port: i32,
 }
 
-struct MultipartRegexs {
+struct MultipartRegexps {
     boundary: Regex,
     form_data: Regex,
     mime: Regex,
@@ -56,15 +56,15 @@ fn main() -> Fallible<()> {
 
     std::fs::create_dir_all("data")?;
 
-    let multipart_regexs = Arc::new(create_multipart_regexs()?);
+    let multipart_regexps = Arc::new(create_multipart_regexps()?);
 
     hyper::rt::run(
         Server::bind(&format!("0.0.0.0:{}", opt.port).parse()?)
             .serve(move || {
                 info!("new service");
-                let multipart_regexs = multipart_regexs.clone();
+                let multipart_regexps = multipart_regexps.clone();
                 service::service_fn(move |req| {
-                    let multipart_regexs = multipart_regexs.clone();
+                    let multipart_regexps = multipart_regexps.clone();
                     info!("uri: {:?}", req.uri());
                     info!("version: {:?}", req.version());
                     info!("headers: {:?}", req.headers());
@@ -85,7 +85,7 @@ fn main() -> Fallible<()> {
                     match req.uri().path() {
                         "/upload" => {
                             if req.method() == &Method::POST {
-                                upload_handler(req, multipart_regexs)
+                                upload_handler(req, multipart_regexps)
                             } else {
                                 handler_method_not_allowed()
                             }
@@ -124,13 +124,13 @@ struct ParseMultipartContext {
     filename: Option<String>,
     file_writer: Option<BufWriter<std::fs::File>>,
     buffer: Vec<u8>,
-    regexs: Arc<MultipartRegexs>,
+    regexps: Arc<MultipartRegexps>,
     body_skip_crlf: bool,
     file_root: PathBuf,
 }
 
 impl ParseMultipartContext {
-    fn new(boundary: String, regexs: Arc<MultipartRegexs>, file_root: PathBuf) -> Self {
+    fn new(boundary: String, regexps: Arc<MultipartRegexps>, file_root: PathBuf) -> Self {
         Self {
             boundary,
             command: ParseType::LoadBoundary,
@@ -139,7 +139,7 @@ impl ParseMultipartContext {
             filename: Default::default(),
             file_writer: Default::default(),
             buffer: Default::default(),
-            regexs,
+            regexps,
             body_skip_crlf: Default::default(),
             file_root,
         }
@@ -232,18 +232,18 @@ impl ParseMultipartCommand for ParseType {
 
                 match String::from_utf8(line) {
                     Ok(s) => {
-                        let reg_formdata = &context.regexs.form_data;
-                        let reg_mime = &context.regexs.mime;
+                        let reg_formdata = &context.regexps.form_data;
+                        let reg_mime = &context.regexps.mime;
                         if reg_formdata.is_match(&s) {
                             info!("ContentDescription: '{}'", s);
-                            match context.regexs.content_disposition_name.captures(&s) {
+                            match context.regexps.content_disposition_name.captures(&s) {
                                 Some(name) => match name.get(1) {
                                     Some(name) => context.name = Some(name.as_str().to_owned()),
                                     None => return Err(format_err!("unexpected")),
                                 },
                                 None => (),
                             }
-                            match context.regexs.content_disposition_filename.captures(&s) {
+                            match context.regexps.content_disposition_filename.captures(&s) {
                                 Some(filename) => match filename.get(1) {
                                     Some(filename) => {
                                         context.file_uuid = Some(Uuid::new_v4());
@@ -364,12 +364,12 @@ impl ParseMultipartCommand for ParseType {
     }
 }
 
-fn upload_handler(req: Request<Body>, multipart_regexs: Arc<MultipartRegexs>) -> BoxFut {
+fn upload_handler(req: Request<Body>, multipart_regexps: Arc<MultipartRegexps>) -> BoxFut {
     let file_root = "data";
     if let Some(val) = req.headers().get(hyper::header::CONTENT_TYPE) {
         if let Ok(a) = val.to_str() {
             if a.to_lowercase().contains("multipart/form-data") {
-                let reg = &multipart_regexs.boundary;
+                let reg = &multipart_regexps.boundary;
 
                 let boundary = match reg.captures(a) {
                     Some(cap) => match cap.get(1) {
@@ -397,7 +397,7 @@ fn upload_handler(req: Request<Body>, multipart_regexs: Arc<MultipartRegexs>) ->
                         .fold(
                             ParseMultipartContext::new(
                                 boundary,
-                                multipart_regexs.clone(),
+                                multipart_regexps.clone(),
                                 PathBuf::new().join(file_root),
                             ),
                             move |mut context, data| {
@@ -527,14 +527,14 @@ fn handler_not_found() -> BoxFut {
     ))
 }
 
-fn create_multipart_regexs() -> Fallible<MultipartRegexs> {
+fn create_multipart_regexps() -> Fallible<MultipartRegexps> {
     let boundary = Regex::new("boundary=([^;]*)")?;
     let form_data = Regex::new("^Content-Disposition: form-data(;|$)")?;
     let mime = Regex::new("Content-Type: (.*)$")?;
     let content_disposition_name = Regex::new(r#"^Content-Disposition:.* name="([^"]*)"(;|\r\n)"#)?;
     let content_disposition_filename =
         Regex::new(r#"^Content-Disposition:.* filename="([^"]*)"(;|\r\n)"#)?;
-    Ok(MultipartRegexs {
+    Ok(MultipartRegexps {
         boundary,
         form_data,
         mime,
