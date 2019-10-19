@@ -31,7 +31,7 @@ use transfer_rs::transfer_rs::prelude::*;
 type BoxFut = Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>;
 
 #[derive(StructOpt)]
-#[structopt(name = "fileserver")]
+#[structopt(name = "transfer")]
 struct Opt {
     #[structopt(short, long)]
     /// Port number
