@@ -23,6 +23,7 @@ use futures::{future, Future, Stream};
 use hyper::{service, Body, Method, Request, Response, Server, StatusCode};
 use log::{debug, info, warn};
 use regex::Regex;
+use serde_derive::Serialize;
 use structopt::StructOpt;
 use uuid::Uuid;
 
@@ -44,6 +45,20 @@ struct MultipartRegexps {
     mime: Regex,
     content_disposition_name: Regex,
     content_disposition_filename: Regex,
+}
+
+#[derive(Serialize)]
+struct UploadResult {
+    part: Vec<UploadResultPart>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UploadResultPart {
+    name: String,
+    file_name: String,
+    url: String,
+    error: Option<String>,
 }
 
 fn main() -> Fallible<()> {
@@ -70,21 +85,26 @@ fn main() -> Fallible<()> {
                     info!("headers: {:?}", req.headers());
                     info!("method: {:?}", req.method());
 
-                    match req.method() {
-                        &Method::GET
-                        | &Method::PUT
-                        | &Method::DELETE
-                        | &Method::HEAD
-                        | &Method::OPTIONS
-                        | &Method::CONNECT
-                        | &Method::PATCH
-                        | &Method::TRACE => return handler_not_implemented(),
+                    match *req.method() {
+                        Method::PUT
+                        | Method::DELETE
+                        | Method::HEAD
+                        | Method::OPTIONS
+                        | Method::CONNECT
+                        | Method::PATCH
+                        | Method::TRACE => return handler_not_implemented(),
                         _ => (),
+                    }
+
+                    // TODO: sanitize path. e.g. http://host/../filename.jpg
+                    let get_path_regexp = Regex::new(&format!(r#"^/([^/]*)/([^/]*)$"#)).unwrap();
+                    if *req.method() == Method::GET && get_path_regexp.is_match(req.uri().path()) {
+                        return get_handler();
                     }
 
                     match req.uri().path() {
                         "/upload" => {
-                            if req.method() == &Method::POST {
+                            if *req.method() == Method::POST {
                                 upload_handler(req, multipart_regexps)
                             } else {
                                 handler_method_not_allowed()
@@ -100,6 +120,15 @@ fn main() -> Fallible<()> {
 
     info!("Bye");
     Ok(())
+}
+
+fn get_handler() -> BoxFut {
+    Box::new(future::ok(
+        Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::from("TODO get handler"))
+            .unwrap(),
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,6 +151,7 @@ struct ParseMultipartContext {
     name: Option<String>,
     file_uuid: Option<Uuid>,
     filename: Option<String>,
+    processed: Vec<String>,
     file_writer: Option<BufWriter<std::fs::File>>,
     buffer: Vec<u8>,
     regexps: Arc<MultipartRegexps>,
@@ -137,6 +167,7 @@ impl ParseMultipartContext {
             name: Default::default(),
             file_uuid: Default::default(),
             filename: Default::default(),
+            processed: Default::default(),
             file_writer: Default::default(),
             buffer: Default::default(),
             regexps,
@@ -246,13 +277,23 @@ impl ParseMultipartCommand for ParseType {
                             match context.regexps.content_disposition_filename.captures(&s) {
                                 Some(filename) => match filename.get(1) {
                                     Some(filename) => {
-                                        context.file_uuid = Some(Uuid::new_v4());
-                                        context.filename = Some(filename.as_str().to_owned());
+                                        let mut uuid = Some(Uuid::new_v4());
+                                        let mut filename = Some(filename.as_str().to_owned());
+                                        std::mem::swap(&mut context.file_uuid, &mut uuid);
+                                        std::mem::swap(&mut context.filename, &mut filename);
+                                        if uuid.is_some() && filename.is_some() {
+                                            context.processed.push(format!(
+                                                "{}/{}",
+                                                uuid.unwrap(),
+                                                filename.unwrap()
+                                            ));
+                                        }
                                     }
                                     None => return Err(format_err!("unexpected")),
                                 },
                                 None => (),
                             }
+                            info!("name: {:?}, filename: {:?}", context.name, context.filename);
                             return Ok(CommandRet::NextCommand);
                         } else if let Some(data) = reg_mime.captures(&s) {
                             match data.get(1) {
@@ -359,103 +400,50 @@ impl ParseMultipartCommand for ParseType {
                     }
                 }
             }
-            ParseType::End => Ok(CommandRet::Consumed),
+            ParseType::End => {
+                if context.file_uuid.is_some() && context.filename.is_some() {
+                    context.processed.push(format!(
+                        "{}/{}",
+                        context.file_uuid.as_ref().unwrap(),
+                        context.filename.as_ref().unwrap()
+                    ));
+                }
+                Ok(CommandRet::Consumed)
+            }
         }
     }
 }
 
 fn upload_handler(req: Request<Body>, multipart_regexps: Arc<MultipartRegexps>) -> BoxFut {
-    let file_root = "data";
-    if let Some(val) = req.headers().get(hyper::header::CONTENT_TYPE) {
-        if let Ok(a) = val.to_str() {
-            if a.to_lowercase().contains("multipart/form-data") {
-                let reg = &multipart_regexps.boundary;
-
-                let boundary = match reg.captures(a) {
-                    Some(cap) => match cap.get(1) {
-                        Some(boundary) => boundary.as_str().to_owned(),
-                        None => {
-                            return Box::new(future::ok(
-                                Response::builder()
-                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                    .body(Body::from("failed to parse boundary"))
-                                    .unwrap(),
-                            ));
-                        }
-                    },
-                    None => {
-                        return Box::new(future::ok(
-                            Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Body::from("failed to capture"))
-                                .unwrap(),
-                        ));
-                    }
-                };
-                return Box::new(
-                    req.into_body()
-                        .fold(
-                            ParseMultipartContext::new(
-                                boundary,
-                                multipart_regexps.clone(),
-                                PathBuf::new().join(file_root),
-                            ),
-                            move |mut context, data| {
-                                debug!("chunk size: {}", data.len());
-                                let mut buf = Vec::new();
-                                std::mem::swap(&mut context.buffer, &mut buf);
-                                buf.extend(data);
-                                let mut reader = BufReader::new(buf.as_slice());
-
-                                if context.command == ParseType::End {
-                                    warn!("parsetype is end but received chunk");
-                                    return future::ok::<_, hyper::Error>(context);
-                                }
-
-                                loop {
-                                    match &context
-                                        .command
-                                        .clone()
-                                        .execute(&mut context, &mut reader)
-                                    {
-                                        Ok(CommandRet::NextCommand) => (),
-                                        Ok(CommandRet::Consumed) => break,
-                                        Err(e) => {
-                                            // TODO:
-                                            warn!("{:?}", e);
-                                        }
-                                    }
-                                }
-                                return future::ok::<_, hyper::Error>(context);
-                            },
-                        )
-                        .map(|context| {
-                            if context.command == ParseType::End {
-                                info!("success end");
-                            } else {
-                                warn!(
-                                    "all data received but unexpected state: {:?}",
-                                    context.command
-                                );
-                            }
-                            Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Body::from("TODO"))
-                                .unwrap()
-                        }),
-                );
-                //                let body = req.into_body().concat2();
-                //                return Box::new(body.map(|data| {
-                //                    std::fs::write("data/aa", data).ok();
-                //                    Response::builder()
-                //                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                //                        .body(Body::from("TODO"))
-                //                        .unwrap()
-                //                }));
+    if let Some(content_type) = req.headers().get(hyper::header::CONTENT_TYPE) {
+        if let Ok(content_type) = content_type.to_str() {
+            if content_type.contains("multipart/form-data") {
+                // curl -F myfile=@$HOME/path/to/file
+                return upload_handler_multipart(req, multipart_regexps);
+            } else if content_type == "application/x-www-form-urlencoded" {
+                info!("TODO: {}", content_type);
+                // curl --data-urlencode name@file --data-urlencode name@file
+                // name=<encoded>&name=<encoded>
+                // curl --data-urlencode @file --data-urlencode @file
+                // <encoded>&<encoded>
+                return Box::new(future::ok(
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("TODO"))
+                        .unwrap(),
+                ));
             }
         }
     }
 
+    // curl -H "Content-Type: application/octet-stream" --data-binary @$HOME/path/to/file
+    // curl -H "Content-Type: image/png" --data-binary @$HOME/path/to/file
+    // curl -H "Content-Type: foobar/baz" --data-binary @$HOME/path/to/file
+    upload_handler_file(req)
+}
+
+fn upload_handler_file(req: Request<Body>) -> BoxFut {
+    let file_root = "data";
     let (head, body) = req.into_parts();
     let filename = match head.headers.get("x-tp-filename") {
         Some(filename) => match filename.to_str() {
@@ -464,13 +452,21 @@ fn upload_handler(req: Request<Body>, multipart_regexps: Arc<MultipartRegexps>) 
         },
         None => "a".to_owned(),
     };
+    let host = head
+        .headers
+        .get(hyper::header::HOST)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     let body = body.concat2();
     Box::new(body.map(move |data| {
+        let host = host;
         let file_id = Uuid::new_v4();
         let filepath = PathBuf::new()
             .join(file_root)
             .join(format!("{}", file_id))
-            .join(filename);
+            .join(&filename);
         match std::fs::create_dir_all(filepath.parent().unwrap()) {
             Ok(_) => (),
             Err(e) => {
@@ -481,12 +477,21 @@ fn upload_handler(req: Request<Body>, multipart_regexps: Arc<MultipartRegexps>) 
                     .unwrap();
             }
         }
-        match std::fs::write(filepath, data) {
+        match std::fs::write(&filepath, data) {
             Ok(_) => {
                 info!("wrote");
+                let upload_result = UploadResult {
+                    part: vec![UploadResultPart {
+                        name: "name".to_owned(),
+                        file_name: filepath.file_name().unwrap().to_str().unwrap().to_owned(),
+                        url: format!("http://{}/{}/{}", host, file_id, filename),
+                        error: None,
+                    }],
+                    error: None,
+                };
                 Response::builder()
                     .status(StatusCode::OK)
-                    .body(Body::from("ok"))
+                    .body(Body::from(serde_json::to_string(&upload_result).unwrap()))
                     .unwrap()
             }
             Err(e) => {
@@ -498,6 +503,113 @@ fn upload_handler(req: Request<Body>, multipart_regexps: Arc<MultipartRegexps>) 
             }
         }
     }))
+}
+
+fn upload_handler_multipart(
+    req: Request<Body>,
+    multipart_regexps: Arc<MultipartRegexps>,
+) -> BoxFut {
+    let file_root = "data";
+    let reg = &multipart_regexps.boundary;
+
+    let content_type = match req.headers().get(hyper::header::CONTENT_TYPE) {
+        Some(data) => match data.to_str() {
+            Ok(data) => data,
+            Err(e) => panic!("TODO"),
+        },
+        None => unreachable!(),
+    };
+
+    let boundary = match reg.captures(content_type) {
+        Some(cap) => match cap.get(1) {
+            Some(boundary) => boundary.as_str().to_owned(),
+            None => {
+                return Box::new(future::ok(
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("failed to parse boundary"))
+                        .unwrap(),
+                ));
+            }
+        },
+        None => {
+            return Box::new(future::ok(
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("failed to capture"))
+                    .unwrap(),
+            ));
+        }
+    };
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    Box::new(
+        req.into_body()
+            .fold(
+                ParseMultipartContext::new(
+                    boundary,
+                    multipart_regexps.clone(),
+                    PathBuf::new().join(file_root),
+                ),
+                move |mut context, data| {
+                    debug!("chunk size: {}", data.len());
+                    let mut buf = Vec::new();
+                    std::mem::swap(&mut context.buffer, &mut buf);
+                    buf.extend(data);
+                    let mut reader = BufReader::new(buf.as_slice());
+
+                    if context.command == ParseType::End {
+                        warn!("parsetype is end but received chunk");
+                        return future::ok::<_, hyper::Error>(context);
+                    }
+
+                    loop {
+                        match &context.command.clone().execute(&mut context, &mut reader) {
+                            Ok(CommandRet::NextCommand) => (),
+                            Ok(CommandRet::Consumed) => break,
+                            Err(e) => {
+                                // TODO:
+                                warn!("{:?}", e);
+                            }
+                        }
+                    }
+                    return future::ok::<_, hyper::Error>(context);
+                },
+            )
+            .map(move |context| {
+                if context.command == ParseType::End {
+                    info!("success end");
+                } else {
+                    warn!(
+                        "all data received but unexpected state: {:?}",
+                        context.command
+                    );
+                }
+                let upload_result = UploadResult {
+                    part: context
+                        .processed
+                        .iter()
+                        .map(|data| UploadResultPart {
+                            name: "name".to_owned(),
+                            file_name: "file_name".to_owned(),
+                            url: format!("http://{}/{}", host, data),
+                            error: None,
+                        })
+                        .collect(),
+                    error: None,
+                };
+                let body = serde_json::to_string(&upload_result).unwrap();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+    )
 }
 
 fn handler_not_implemented() -> BoxFut {
