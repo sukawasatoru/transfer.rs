@@ -19,7 +19,7 @@ structopt = "0.3.3"
 tokio = "0.1.22"
 
 [dependencies.uuid]
-version = "0.7.4"
+version = "0.8.1"
 features = ["v4"]
 
 [target.'cfg(windows)'.dependencies.winapi]
